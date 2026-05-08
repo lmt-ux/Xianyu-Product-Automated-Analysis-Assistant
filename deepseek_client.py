@@ -91,3 +91,48 @@ async def batch_analyze(products: List[Dict[str, Any]], market_info: str, max_co
             return {**product, **analysis}
     tasks = [analyze_with_semaphore(p) for p in products]
     return await asyncio.gather(*tasks)
+
+
+async def filter_relevant_items(keyword: str, items: list) -> list:
+    """
+    用 AI 过滤不相关的商品（如搜手机时过滤手机壳），保留真正属于该品类的商品
+    items: [{"title": "xxx", "price": 123.0}, ...]
+    返回: 过滤后的 items 列表（不相关的被移除）
+    """
+    if not items:
+        return items
+
+    item_lines = []
+    for i, item in enumerate(items):
+        item_lines.append(f"[{i}] {item['title']} - ¥{item['price']}")
+
+    prompt = f"""搜索关键词: "{keyword}"
+
+以下是从什么值得买搜索到的商品列表，有些可能是配件、周边产品（如搜索"手机"时出现的手机壳、充电器、贴膜等）。
+请判断每个商品是否真正属于"{keyword}"这个核心品类（是则保留，否则排除）。
+
+只返回 JSON，key 为序号，value 为 true（保留）或 false（排除）：
+
+{chr(10).join(item_lines)}"""
+    try:
+        response = await client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            response_format={"type": "json_object"}
+        )
+        result = json.loads(response.choices[0].message.content)
+        kept, removed = 0, 0
+        filtered = []
+        for i, item in enumerate(items):
+            if result.get(str(i), True):
+                filtered.append(item)
+                kept += 1
+            else:
+                removed += 1
+        if removed > 0:
+            print(f"AI过滤: 保留 {kept} 件, 移除 {removed} 件不相关商品")
+        return filtered
+    except Exception as e:
+        print(f"AI过滤失败（保留全部）: {e}")
+        return items

@@ -7,6 +7,7 @@ import os
 from typing import Optional, Dict, Any
 from playwright.async_api import async_playwright
 from dotenv import load_dotenv
+from deepseek_client import filter_relevant_items
 
 load_dotenv()
 
@@ -21,6 +22,14 @@ USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/119.0",
 ]
 
+EXCLUDE_KEYWORDS = [
+    "壳", "膜", "套", "充电", "数据线", "贴膜", "保护壳", "钢化膜",
+    "充电器", "充电头", "充电宝", "支架", "挂绳", "指环", "背夹",
+    "防摔", "防水壳", "镜头膜", "耳机套", "屏幕膜", "保护套",
+    "卡槽", "卡贴", "转接头", "扩展坞", "分线器", "集线器",
+    "线缆", "充电线", "磁吸", "手机挂件", "手机链",
+]
+
 async def random_sleep(min_sec: float = 0.5, max_sec: float = 2.0):
     await asyncio.sleep(random.uniform(min_sec, max_sec))
 
@@ -30,6 +39,49 @@ async def simulate_human_behavior(page):
     await random_sleep(0.3, 0.8)
     await page.mouse.move(random.randint(100, 1200), random.randint(200, 800))
     await random_sleep(0.2, 0.5)
+
+def keyword_prefilter(items: list) -> list:
+    filtered = []
+    removed = 0
+    for item in items:
+        title = item.get("title", "")
+        is_excluded = any(kw in title for kw in EXCLUDE_KEYWORDS)
+        if is_excluded:
+            removed += 1
+        else:
+            filtered.append(item)
+    if removed > 0:
+        print(f"关键字过滤: 排除 {removed} 件明显不相关的商品")
+    return filtered
+
+
+def calc_price_stats(prices: list) -> dict:
+    """
+    传入价格列表，返回包含 IQR 中位数等统计信息的字典
+    prices: [123.0, 456.0, ...]
+    """
+    if not prices:
+        return None
+    prices = sorted(prices)
+    n = len(prices)
+    avg = round(sum(prices) / n, 2)
+    median = prices[n // 2] if n % 2 else round((prices[n // 2 - 1] + prices[n // 2]) / 2, 2)
+    q1_idx = n // 4
+    q3_idx = 3 * n // 4
+    iqr_prices = prices[q1_idx:q3_idx] if q3_idx > q1_idx else prices
+    return {
+        "min_price": prices[0],
+        "max_price": prices[-1],
+        "avg_price": avg,
+        "median_price": median,
+        "iqr_min": iqr_prices[0],
+        "iqr_max": iqr_prices[-1],
+        "iqr_avg": round(sum(iqr_prices) / len(iqr_prices), 2),
+        "sample_count": n,
+        "iqr_sample_count": len(iqr_prices),
+        "removed_by_iqr": n - len(iqr_prices),
+        "price_list": prices[:200],
+    }
 
 async def get_smzdm_price_stats(keyword: str, timeout: int = 30000, max_retries: int = 2) -> Optional[Dict[str, Any]]:
     print(f"\n--- 开始什么值得买价格采集: {keyword} ---")
@@ -73,51 +125,74 @@ async def get_smzdm_price_stats(keyword: str, timeout: int = 30000, max_retries:
 
                 await simulate_human_behavior(page)
 
-                price_selectors = [
-                    ".z-highlight", ".price", ".feed-price", ".list-price",
-                    ".buy-price", ".feed-ext .price", ".feed-now .price"
-                ]
-                prices = []
-                for sel in price_selectors:
-                    elements = await page.query_selector_all(sel)
-                    for elem in elements:
-                        text = await elem.inner_text()
-                        match = re.search(r'(\d+(?:\.\d+)?)', text)
-                        if match:
-                            price = float(match.group(1))
-                            if 1 <= price <= 100000:
-                                prices.append(price)
+                # ——— 第一步：提取结构化商品（标题+价格配对） ———
+                feed_items = await page.query_selector_all(".feed-row-wide")
+                raw_items = []
+                for fi in feed_items:
+                    title_el = await fi.query_selector("h5.feed-block-title a, .feed-block-title")
+                    if not title_el:
+                        continue
+                    title = (await title_el.inner_text()).strip()
+                    price_el = await fi.query_selector(".z-highlight, .price, .feed-price, .list-price, .buy-price")
+                    if not price_el:
+                        continue
+                    price_text = await price_el.inner_text()
+                    match = re.search(r'(\d+(?:\.\d+)?)', price_text)
+                    if not match:
+                        continue
+                    price = float(match.group(1))
+                    if price < 1 or price > 100000:
+                        continue
+                    raw_items.append({"title": title, "price": price})
 
-                if len(prices) < 3:
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await random_sleep(2, 3)
-                    more = await page.query_selector_all(".z-highlight, .price")
-                    for elem in more:
-                        text = await elem.inner_text()
-                        match = re.search(r'(\d+(?:\.\d+)?)', text)
-                        if match:
-                            price = float(match.group(1))
-                            if 1 <= price <= 100000:
-                                prices.append(price)
+                # ——— 第二步：关键字预过滤 ———
+                filtered_items = keyword_prefilter(raw_items)
 
-                if not prices:
+                # ——— 第三步：AI 过滤（排除配件等不相关商品） ———
+                if filtered_items:
+                    filtered_items = await filter_relevant_items(keyword, filtered_items)
+
+                # ——— 第四步：如果结构化提取失败，降级为旧逻辑 ———
+                if not filtered_items:
+                    if not raw_items:
+                        logger.warning(f"结构化提取失败，降级到通用价格提取")
+                        price_selectors = [
+                            ".z-highlight", ".price", ".feed-price", ".list-price",
+                            ".buy-price", ".feed-ext .price", ".feed-now .price"
+                        ]
+                        prices = []
+                        for sel in price_selectors:
+                            elements = await page.query_selector_all(sel)
+                            for elem in elements:
+                                text = await elem.inner_text()
+                                match = re.search(r'(\d+(?:\.\d+)?)', text)
+                                if match:
+                                    p = float(match.group(1))
+                                    if 1 <= p <= 100000:
+                                        prices.append(p)
+                        if prices:
+                            stats = calc_price_stats(prices)
+                            if stats:
+                                stats["source"] = "smzdm"
+                                stats["note"] = "降级模式（未提取到标题），价格可能包含配件"
+                                logger.info(f"什么值得买 {keyword} - 价格区间: {stats['min_price']}~{stats['max_price']}, 均价: {stats['avg_price']}, 中位数: {stats['median_price']}, IQR区间: {stats['iqr_min']}~{stats['iqr_max']}, 样本数: {stats['sample_count']}（降级模式）")
+                                return stats
+                    else:
+                        logger.warning("过滤后无数据，恢复全部商品")
+                        filtered_items = raw_items
+
+                # ——— 第五步：计算结果 ———
+                prices = sorted(set(item["price"] for item in filtered_items))
+                stats = calc_price_stats(prices)
+                if not stats:
                     logger.warning(f"未提取到价格数据，关键词: {keyword}")
                     if attempt < max_retries:
                         await asyncio.sleep(random.uniform(8, 12))
                         continue
                     return None
-
-                prices = sorted(set(prices))
-                result = {
-                    "min_price": min(prices),
-                    "max_price": max(prices),
-                    "avg_price": round(sum(prices) / len(prices), 2),
-                    "sample_count": len(prices),
-                    "price_list": prices[:200],
-                    "source": "smzdm"
-                }
-                logger.info(f"什么值得买 {keyword} - 价格区间: {result['min_price']}~{result['max_price']}, 均价: {result['avg_price']}, 样本数: {result['sample_count']}")
-                return result
+                stats["source"] = "smzdm"
+                logger.info(f"什么值得买 {keyword} - 价格区间: {stats['min_price']}~{stats['max_price']}, 均价: {stats['avg_price']}, 中位数: {stats['median_price']}, IQR区间: {stats['iqr_min']}~{stats['iqr_max']}, 样本数: {stats['sample_count']}, IQR样本: {stats['iqr_sample_count']}")
+                return stats
 
         except Exception as e:
             logger.error(f"什么值得买搜索异常 [{keyword}]: {e}")

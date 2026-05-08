@@ -11,7 +11,7 @@ from tortoise.contrib.fastapi import register_tortoise
 from dotenv import load_dotenv
 import asyncio
 import glob
-from price_fetcher import get_market_price_stats
+from price_fetcher import get_market_price_stats, calc_price_stats
 from deepseek_client import batch_analyze
 
 load_dotenv()
@@ -112,7 +112,8 @@ def save_to_excel_with_analysis(data_list, keyword):
 
     order = ["商品标题", "当前售价", "建议售价", "预估利润",
              "预期利润率", "评分", "建议", "理由",
-             "发货地区", "卖家昵称", "商品链接", "发布时间", "关键词", "爬取时间"]
+             "商品成色", "商品标签", "业务类型",
+             "发货地区", "卖家昵称", "商品链接", "商品ID", "发布时间", "关键词", "爬取时间"]
     order = [col for col in order if col in df.columns]
     df = df[order]
 
@@ -222,6 +223,29 @@ async def scrape_xianyu(keyword: str, max_pages: int = 1):
                         publish_time_str = "未知时间"
                         if pub_time and pub_time.isdigit():
                             publish_time_str = datetime.fromtimestamp(int(pub_time)/1000).strftime("%Y-%m-%d %H:%M")
+
+                        # ---- 额外详情字段 ----
+                        item_main = await safe_get(item, "data", "item", "main", default={})
+                        tags = await safe_get(main_data, "tags", default=None)
+                        tag_list = []
+                        if isinstance(tags, list):
+                            for t in tags:
+                                if isinstance(t, dict):
+                                    tag_list.append(t.get("text", ""))
+                                elif isinstance(t, str):
+                                    tag_list.append(t)
+                        elif isinstance(tags, str):
+                            tag_list = [tags]
+
+                        quality = await safe_get(main_data, "quality", default="")
+                        if not quality:
+                            quality = await safe_get(main_data, "itemStatus", default="")
+                        biz_type = await safe_get(main_data, "bizType", default="")
+                        want_count_raw = await safe_get(click_params, "wantCount", default="")
+                        item_id = await safe_get(click_params, "itemId", default="")
+                        if not item_id:
+                            item_id = await safe_get(main_data, "itemId", default="")
+
                         data_list.append({
                             "商品标题": title,
                             "当前售价": price,
@@ -229,7 +253,11 @@ async def scrape_xianyu(keyword: str, max_pages: int = 1):
                             "卖家昵称": seller,
                             "商品链接": raw_link.replace("fleamarket://", "https://www.goofish.com/"),
                             "商品图片链接": f"https:{image_url}" if image_url and not image_url.startswith("http") else image_url,
-                            "发布时间": publish_time_str
+                            "发布时间": publish_time_str,
+                            "商品ID": item_id,
+                            "商品标签": "|".join(tag_list) if tag_list else "",
+                            "商品成色": quality,
+                            "业务类型": biz_type,
                         })
                 except Exception as e:
                     print(f"解析响应异常: {e}")
@@ -272,44 +300,156 @@ async def scrape_xianyu(keyword: str, max_pages: int = 1):
 
     return data_list
 
+
+# ========== 闲鱼数据统计（按型号聚类 + IQR） ==========
+def extract_model(title: str, keyword: str) -> str:
+    """从标题中提取具体型号，eg: '小米14 12+256G 白色' → '小米14'"""
+    kw = keyword.lower()
+    title_lower = title.lower()
+    if kw not in title_lower:
+        return "其他"
+    after_kw = title_lower[title_lower.index(kw) + len(kw):].strip()
+    variant = ""
+    for word in after_kw.split():
+        if any(c.isalpha() or c.isdigit() for c in word):
+            if word in ("白色", "黑色", "蓝色", "绿色", "紫色", "金色", "银色", "灰色",
+                        "红色", "橙色", "粉色", "颜色", "国行", "港版", "美版", "日版",
+                        "公开版", "全网通", "移动版", "联通版", "电信版", "未激活", "在保",
+                        "过保", "无锁", "有锁", "卡贴机", "官换机", "资源机"):
+                continue
+            variant = word
+            break
+    if variant:
+        return f"{keyword} {variant}"
+    return keyword
+
+
+def calc_xianyu_stats(data_list: list, keyword: str) -> dict:
+    """按型号聚类闲鱼数据，输出每个型号和整体的 IQR 统计"""
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for item in data_list:
+        price_str = item.get("当前售价", "").replace("¥", "")
+        try:
+            price = float(price_str)
+        except (ValueError, TypeError):
+            continue
+        model = extract_model(item.get("商品标题", ""), keyword)
+        groups[model].append(price)
+
+    all_prices = []
+    model_lines = []
+    for model_name in sorted(groups.keys()):
+        prices = groups[model_name]
+        all_prices.extend(prices)
+        if len(prices) >= 2:
+            median = sorted(prices)[len(prices) // 2]
+            model_lines.append(f"  - {model_name}: {len(prices)}件, 中位数¥{median}")
+        else:
+            model_lines.append(f"  - {model_name}: {len(prices)}件, ¥{prices[0]}")
+
+    stats = calc_price_stats(all_prices) if all_prices else None
+    return {
+        "stats": stats,
+        "model_breakdown": model_lines,
+    }
+
+
 # ========== API 接口 ==========
 @app.post("/search/", summary="商品搜索接口（可选AI倒卖分析）")
 async def search_items(keyword: str, max_pages: int = 1, enable_ai: bool = True):
+    errors = []
+    data_list = []
+    xianyu_stats = {}
+    smzdm_stats = {}
+    market_info = "暂无可靠市场参考价"
+    analyzed_data = []
+    new_count = 0
+    new_ids = []
+    excel_file = ""
+    high_value_items = []
+    ai_enabled = False
+
+    # 1. 闲鱼爬取（必须成功）
     try:
-        # 1. 先执行闲鱼爬取
         data_list = await scrape_xianyu(keyword, max_pages)
-        if not data_list:
-            return {
-                "status": "no_data",
-                "keyword": keyword,
-                "message": "未获取到任何商品"
-            }
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"闲鱼爬取失败: {str(e)}")
 
-        # 2. 闲鱼爬取完成后，获取市场价格参考（替代原来的京东）
-        market_stats = await get_market_price_stats(keyword)
+    if not data_list:
+        return {"status": "no_data", "keyword": keyword, "message": "未获取到任何商品"}
 
-        # 构造市场信息字符串
-        if market_stats and market_stats.get('sample_count', 0) > 0:
-            market_info = f"市场参考价（什么值得买）: 价格区间 {market_stats['min_price']}~{market_stats['max_price']}元, 平均价 {market_stats['avg_price']}元 (采样{market_stats['sample_count']}件商品)"
-        else:
-            market_info = "暂无可靠市场参考价"
+    # 2. 闲鱼自身统计
+    try:
+        xianyu_stats = calc_xianyu_stats(data_list, keyword)
+    except Exception as e:
+        errors.append(f"闲鱼统计失败: {str(e)[:100]}")
 
-        # 3. AI 分析（所有商品共用 market_info）
-        if enable_ai:
+    # 3. 什么值得买比价
+    try:
+        smzdm_stats = await get_market_price_stats(keyword)
+    except Exception as e:
+        errors.append(f"什么值得买比价失败: {str(e)[:100]}")
+
+    # 4. 构造市场信息
+    try:
+        parts = []
+        if xianyu_stats.get("stats"):
+            s = xianyu_stats["stats"]
+            parts.append(
+                f"闲鱼同款参考: 均价¥{s['avg_price']}, "
+                f"中位数¥{s['median_price']}, "
+                f"核心成交区间¥{s['iqr_min']}~¥{s['iqr_max']} "
+                f"(采样{s['sample_count']}件, 剔除{s['removed_by_iqr']}件极端值)"
+            )
+            parts.append("型号分布:\n" + "\n".join(xianyu_stats.get("model_breakdown", [])))
+
+        if smzdm_stats and smzdm_stats.get('sample_count', 0) > 0:
+            s = smzdm_stats
+            note = s.get('note', '')
+            note_suffix = f"（{note}）" if note else ""
+            parts.append(
+                f"什么值得买参考: 均价¥{s['avg_price']}, "
+                f"中位数¥{s['median_price']}, "
+                f"核心成交区间¥{s['iqr_min']}~¥{s['iqr_max']} "
+                f"(采样{s['sample_count']}件){note_suffix}"
+            )
+        if parts:
+            market_info = "\n".join(parts)
+    except Exception as e:
+        errors.append(f"构造市场信息失败: {str(e)[:100]}")
+
+    print(f"市场参考信息:\n{market_info}")
+
+    # 5. AI 分析
+    if enable_ai:
+        try:
             print("正在调用 DeepSeek AI 分析商品倒卖价值...")
             analyzed_data = await batch_analyze(data_list, market_info=market_info, max_concurrent=3)
-        else:
+            ai_enabled = True
+        except Exception as e:
+            errors.append(f"AI分析失败(已回退为爬虫数据): {str(e)[:100]}")
             analyzed_data = data_list
+    else:
+        analyzed_data = data_list
 
-        # 4. 保存到数据库
+    # 6. 保存到数据库
+    try:
         new_count, new_ids = await save_to_db(analyzed_data)
+    except Exception as e:
+        errors.append(f"数据库保存失败: {str(e)[:100]}")
 
-        # 5. 导出 Excel
-        excel_file = save_to_excel_with_analysis(analyzed_data, keyword)
+    # 7. 导出 Excel
+    try:
+        excel_file = save_to_excel_with_analysis(analyzed_data, keyword) or ""
+    except Exception as e:
+        errors.append(f"Excel导出失败: {str(e)[:100]}")
 
-        # 6. 提取高利润率商品
-        high_value_items = []
-        if enable_ai:
+    # 8. 提取高利润率商品
+    try:
+        if ai_enabled:
             for item in analyzed_data:
                 margin_str = item.get("预期利润率", "0%")
                 try:
@@ -327,21 +467,25 @@ async def search_items(keyword: str, max_pages: int = 1, enable_ai: bool = True)
                         "建议": item.get("建议"),
                         "理由": item.get("理由")
                     })
-
-        return {
-            "status": "success",
-            "keyword": keyword,
-            "total_results": len(data_list),
-            "new_records": new_count,
-            "new_record_ids": new_ids,
-            "excel_file": excel_file,
-            "ai_enabled": enable_ai,
-            "high_value_items": high_value_items
-        }
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"爬取或分析失败: {str(e)}")
+        errors.append(f"提取高利润率商品失败: {str(e)[:100]}")
+
+    final_status = "partial_success" if errors else "success"
+    response = {
+        "status": final_status,
+        "keyword": keyword,
+        "total_results": len(data_list),
+        "new_records": new_count,
+        "new_record_ids": new_ids,
+        "excel_file": excel_file,
+        "ai_enabled": ai_enabled,
+        "high_value_items": high_value_items,
+        "xianyu_stats": xianyu_stats.get("stats"),
+        "smzdm_stats": smzdm_stats,
+    }
+    if errors:
+        response["errors"] = errors
+    return response
 
 if __name__ == "__main__":
     import uvicorn

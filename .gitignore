@@ -1,2 +1,8 @@
 xianyu_error.png
 .env
+taobao_auth.json
+jd_auth.json
+__pycache__/
+exports/
+smzdm_debug/
+jd_debug/
